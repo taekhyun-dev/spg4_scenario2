@@ -35,7 +35,7 @@ class Satellite_Manager:
         
         # [Topology 관리]
         self.masters: Set[int] = set()           # Master 위성 ID 집합
-        self.plane_workers: Dict[int, List[int]] = defaultdict(list) # Plane ID -> Worker IDs
+        self.workers: Set[int] = set()           # Worker 위성 ID 집합
 
         self.check_arr = defaultdict(list)
 
@@ -80,16 +80,15 @@ class Satellite_Manager:
             self.satellites = satellites
             
             # [Topology 구성] 
-            # ID 0-9: Plane 0 (Master 0)
-            # ID 10-19: Plane 1 (Master 10) ...
+            # 각 궤도면의 0번 위성(0, 10, 20, 30, 40)을 Master로 지정
             for sat_id in self.satellites.keys():
-                plane_id = sat_id // 10
                 if sat_id % 10 == 0:
                     self.masters.add(sat_id)
                 else:
-                    self.plane_workers[plane_id].append(sat_id)
+                    self.workers.add(sat_id)
             
-            self.sim_logger.info(f"Constellation Topology: {len(self.masters)} Masters, 5 Planes.")
+            self.sim_logger.info(f"Constellation Topology: {len(self.masters)} Masters, {len(self.workers)} Workers.")
+            self.sim_logger.info("Topology Mode: Dynamic (Inter-plane & Intra-plane allowed)")
             
         except Exception as e:
             self.sim_logger.error(f"TLE 파일 로드 실패: {e}")
@@ -108,8 +107,8 @@ class Satellite_Manager:
         self.sim_logger.info(f"궤도 전파 완료 ({len(self.times)} steps).")
 
         await self.check_iot_comm()
-        await self.check_master_comm() # [Layer 1] Intra-plane 통신 분석
-        await self.check_gs_comm()     # [Layer 2] Global 통신 분석
+        await self.check_master_comm_optimized() # [Layer 1] 최적화된 Inter-plane 통신 분석
+        await self.check_gs_comm()               # [Layer 2] Global 통신 분석
         self.sim_logger.info("모든 통신 스케줄 계산 완료.")
 
         await self.manage_fl_process()
@@ -159,23 +158,39 @@ class Satellite_Manager:
                     }
                     self.check_arr[sat_id].append(event)
 
-    async def check_master_comm(self):
-        """[Layer 1] Worker <-> Master 간의 ISL 통신 가능 시간 분석"""
-        self.sim_logger.info("Layer 1 (Intra-plane) 통신 분석 시작...")
+    async def check_master_comm_optimized(self):
+        """
+        [Layer 1 최적화] 모든 Worker <-> 모든 Master 간의 통신 분석
+        Intra-plane + Inter-plane 모두 포함
+        """
+        self.sim_logger.info("Layer 1 (Intra & Inter-plane) 통신 분석 시작 (Optimized)...")
         
-        ISL_THRESHOLD_KM = 5000.0 # ISL 통신 가능 거리
+        ISL_THRESHOLD_KM = 5000.0 # 표준 ISL 통신 거리 복구 (5000km)
         
-        for plane_id, workers in self.plane_workers.items():
-            master_id = plane_id * 10
-            master_sat = self.satellites[master_id]
+        # 1. 모든 위성의 위치 좌표 미리 계산 (메모리 사용량 증가하지만 속도 대폭 향상)
+        # Shape: (Num_Sats, 3, Num_Steps)
+        self.sim_logger.info("  - 위성 위치 좌표 사전 계산 중...")
+        positions = {}
+        for sat_id, sat in self.satellites.items():
+            positions[sat_id] = sat.at(self.t_vector).position.km
             
-            for worker_id in workers:
-                worker_sat = self.satellites[worker_id]
+        master_ids = list(self.masters)
+        worker_ids = list(self.workers)
+        
+        # 2. Worker별로 모든 Master와의 거리 계산 (Broadcasting)
+        self.sim_logger.info(f"  - {len(worker_ids)} Workers x {len(master_ids)} Masters 거리 계산 중...")
+        
+        for worker_id in worker_ids:
+            w_pos = positions[worker_id] # Shape: (3, Steps)
+            
+            for master_id in master_ids:
+                m_pos = positions[master_id] # Shape: (3, Steps)
                 
-                # 거리 계산 (Vectorized)
-                rel_pos = (worker_sat - master_sat).at(self.t_vector).position.km
-                dists = np.linalg.norm(rel_pos, axis=0)
+                # 유클리드 거리 계산 (Vectorized)
+                # dists shape: (Steps,)
+                dists = np.linalg.norm(w_pos - m_pos, axis=0)
                 
+                # 통신 가능 구간 추출
                 visible_indices = np.where(dists < ISL_THRESHOLD_KM)[0]
                 if len(visible_indices) == 0: continue
                 
@@ -188,13 +203,13 @@ class Satellite_Manager:
                     duration = (self.times[end_idx] - self.times[start_idx]).total_seconds()
                     if duration == 0: duration = 10
                     
-                    # Worker 입장에서의 이벤트 생성
+                    # Worker -> Any Master 접속 이벤트
                     event = {
                         "type": "MASTER_AGGREGATE",
                         "start_time": self.times[start_idx],
                         "end_time": self.times[end_idx],
                         "duration": duration,
-                        "target": f"Master_{master_id}",
+                        "target": f"Master_{master_id}", # 접속 대상 Master (동적)
                         "master_id": master_id
                     }
                     self.check_arr[worker_id].append(event)
@@ -204,7 +219,6 @@ class Satellite_Manager:
         self.sim_logger.info("Layer 2 (Master-GS) 통신 분석 시작...")
         gs = {"name": "Ground Station", "loc": wgs84.latlon(37.5665, 126.9780, elevation_m=34)}
         
-        # [정책] Master 위성만 지상국과 FL 수행
         target_satellites = self.masters
         
         for sat_id in target_satellites:
@@ -258,14 +272,16 @@ class Satellite_Manager:
         return acc, avg_loss
 
     async def manage_fl_process(self):
-        self.sim_logger.info("\n=== 2-Layer 계층적 비동기 연합 학습 시작 ===")
+        self.sim_logger.info("\n=== 2-Layer 계층적 비동기 연합 학습 (Inter/Intra Plane) 시작 ===")
         
         all_events = []
         for sat_id, events in self.check_arr.items():
             for event in events:
                 event['sat_id'] = sat_id
                 all_events.append(event)
+
         all_events.sort(key=lambda x: x['start_time'])
+        [self.sim_logger.info(i) for i in all_events]
         
         self.sim_logger.info(f"📅 총 {len(all_events)}개의 이벤트 처리 시작")
         
@@ -279,7 +295,6 @@ class Satellite_Manager:
             # [Event 1] 로컬 학습 (Master/Worker 공통)
             # -----------------------------------------------------------
             if event['type'] == 'IOT_TRAIN':
-                epochs = 5 
                 loader_idx = sat_id % len(self.client_subsets)
                 dataset = self.client_subsets[loader_idx]
                 train_loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=8, pin_memory=True)
@@ -290,10 +305,10 @@ class Satellite_Manager:
                     model=temp_model,
                     global_state_dict=self.global_model_wrapper.model_state_dict, 
                     train_loader=train_loader,
-                    epochs=epochs,
+                    epochs=LOCAL_EPOCHS,
                     lr=0.005, 
                     device=self.device,
-                    sim_logger=None
+                    sim_logger=self.sim_logger
                 )
                 
                 new_ver = round(current_local_wrapper.version + 0.1, 2)
@@ -306,10 +321,10 @@ class Satellite_Manager:
                 self.sim_logger.info(f"📡 [IoT] SAT_{sat_id} Trained -> v{new_ver:.2f} (Acc: {acc:.2f}%)")
 
             # -----------------------------------------------------------
-            # [Event 2] Layer 1 Aggregation (Worker -> Master)
+            # [Event 2] Layer 1 Aggregation (Worker -> Any Master)
             # -----------------------------------------------------------
             elif event['type'] == 'MASTER_AGGREGATE':
-                master_id = event['master_id']
+                master_id = event['master_id'] # 접속한 Master (자기 궤도면 아니어도 됨)
                 master_wrapper = self.satellite_models[master_id]
                 
                 # 1. Master가 Worker 모델을 Aggregation (Cluster Update)
@@ -320,7 +335,7 @@ class Satellite_Manager:
                     alpha
                 )
                 
-                # Master 버전 업데이트 (Cluster Version)
+                # Master 버전 업데이트
                 new_master_ver = max(master_wrapper.version, current_local_wrapper.version) + 0.01
                 
                 master_wrapper = PyTorchModel(
@@ -331,7 +346,7 @@ class Satellite_Manager:
                 self.satellite_models[master_id] = master_wrapper
                 
                 # 2. Worker가 Master 모델을 Sync (Downlink)
-                # Worker는 Master(Cluster) 모델을 복제해감
+                # Worker는 접속한 Master의 모델을 복제해감 (지식 전파)
                 current_local_wrapper = PyTorchModel(
                     version=new_master_ver,
                     model_state_dict={k: v.clone() for k, v in new_master_state.items()},
@@ -345,14 +360,12 @@ class Satellite_Manager:
             # [Event 3] Layer 2 Aggregation (Master -> GS)
             # -----------------------------------------------------------
             elif event['type'] == 'GS_AGGREGATE':
-                # 정책: 너무 오래된 Master 모델은 강제 동기화
-                if self.global_model_wrapper.version > current_local_wrapper.version + 3.0:
+                if self.global_model_wrapper.version > current_local_wrapper.version + 5.0:
                      current_local_wrapper = PyTorchModel.from_model(self.global_model_net, version=self.global_model_wrapper.version)
                      self.satellite_models[sat_id] = current_local_wrapper
                      self.sim_logger.info(f"📥 [Global] Master_{sat_id} Forced Sync -> v{self.global_model_wrapper.version}")
                      continue
 
-                # 1. GS가 Master 모델을 Aggregation (Global Update)
                 alpha = 0.2
                 new_global_state = weighted_update(
                     self.global_model_wrapper.model_state_dict,
@@ -362,7 +375,6 @@ class Satellite_Manager:
                 
                 new_global_ver = int(self.global_model_wrapper.version) + 1.0
                 
-                # Global 평가
                 temp_model.load_state_dict(new_global_state)
                 g_acc, g_loss = self._evaluate_direct(temp_model, self.val_loader, "GS", new_global_ver, "GLOBAL_TEST")
                 
@@ -382,7 +394,6 @@ class Satellite_Manager:
                 )
                 self.global_model_net.load_state_dict(new_global_state)
                 
-                # 2. Master가 Global 모델을 Sync
                 current_local_wrapper = PyTorchModel.from_model(temp_model, version=new_global_ver)
                 self.satellite_models[sat_id] = current_local_wrapper
                 
@@ -390,3 +401,17 @@ class Satellite_Manager:
 
         self.sim_logger.info("\n=== 시뮬레이션 종료 ===")
         self.sim_logger.info(f"Final Global Model Accuracy: {self.best_acc:.2f}%")
+
+def main():
+    try:
+        start_time = datetime.now(timezone.utc)
+        sim_logger, perf_logger = setup_loggers()
+        sat_manager = Satellite_Manager(start_time, start_time + timedelta(days=30), sim_logger, perf_logger)
+        asyncio.run(sat_manager.run())
+    except KeyboardInterrupt:
+        print("\n시뮬레이션을 종료합니다.")
+    except Exception as e:
+        print(f"Error: {e}")
+        
+if __name__ == "__main__":
+    main()
