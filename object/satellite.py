@@ -328,7 +328,19 @@ class Satellite_Manager:
                 master_wrapper = self.satellite_models[master_id]
                 
                 # 1. Master가 Worker 모델을 Aggregation (Cluster Update)
-                alpha = 0.2
+                local_acc = self.satellite_performances[sat_id]
+                loader_idx = sat_id % len(self.client_subsets)
+                local_data_count = len(self.client_subsets[loader_idx])
+                
+                # alpha = 0.2
+                alpha, _, _, _ = calculate_mixing_weight(
+                    local_ver=current_local_wrapper.version,
+                    global_ver=self.global_model_wrapper.version,
+                    local_acc=local_acc,
+                    global_acc=self.best_acc,
+                    local_data_count=local_data_count,
+                    avg_data_count=self.avg_data_count
+                )
                 new_master_state = weighted_update(
                     master_wrapper.model_state_dict,
                     current_local_wrapper.model_state_dict,
@@ -366,7 +378,19 @@ class Satellite_Manager:
                      self.sim_logger.info(f"📥 [Global] Master_{sat_id} Forced Sync -> v{self.global_model_wrapper.version}")
                      continue
 
-                alpha = 0.2
+                local_acc = self.satellite_performances[sat_id]
+                loader_idx = sat_id % len(self.client_subsets)
+                local_data_count = len(self.client_subsets[loader_idx])
+                
+                # alpha = 0.2
+                alpha, _, _, _ = calculate_mixing_weight(
+                    local_ver=current_local_wrapper.version,
+                    global_ver=self.global_model_wrapper.version,
+                    local_acc=local_acc,
+                    global_acc=self.best_acc,
+                    local_data_count=local_data_count,
+                    avg_data_count=self.avg_data_count
+                )
                 new_global_state = weighted_update(
                     self.global_model_wrapper.model_state_dict,
                     current_local_wrapper.model_state_dict,
