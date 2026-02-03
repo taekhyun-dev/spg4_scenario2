@@ -37,6 +37,8 @@ class Satellite_Manager:
         self.masters: Set[int] = set()           # Master 위성 ID 집합
         self.workers: Set[int] = set()           # Worker 위성 ID 집합
 
+        self.masters_data_count = defaultdict(int)
+
         self.check_arr = defaultdict(list)
 
         # --- [FL 설정] ---
@@ -87,6 +89,10 @@ class Satellite_Manager:
                 else:
                     self.workers.add(sat_id)
             
+            for master_id in self.masters:
+                loader_idx = master_id % len(self.client_subsets)
+                self.masters_data_count[master_id] = len(self.client_subsets[loader_idx])
+
             self.sim_logger.info(f"Constellation Topology: {len(self.masters)} Masters, {len(self.workers)} Workers.")
             self.sim_logger.info("Topology Mode: Dynamic (Inter-plane & Intra-plane allowed)")
             
@@ -286,6 +292,7 @@ class Satellite_Manager:
         self.sim_logger.info(f"📅 총 {len(all_events)}개의 이벤트 처리 시작")
         
         temp_model = create_resnet9(num_classes=self.NUM_CLASSES)
+        avg_cluster_data_count = self.avg_data_count * (self.num_satellites / len(self.masters))
 
         for i, event in enumerate(all_events):
             sat_id = event['sat_id']
@@ -306,7 +313,7 @@ class Satellite_Manager:
                     global_state_dict=self.global_model_wrapper.model_state_dict, 
                     train_loader=train_loader,
                     epochs=LOCAL_EPOCHS,
-                    lr=0.005, 
+                    lr=0.005,
                     device=self.device,
                     sim_logger=self.sim_logger
                 )
@@ -346,6 +353,7 @@ class Satellite_Manager:
                     current_local_wrapper.model_state_dict,
                     alpha
                 )
+                self.masters_data_count[master_id] += local_data_count
                 
                 # Master 버전 업데이트
                 new_master_ver = max(master_wrapper.version, current_local_wrapper.version) + 0.01
@@ -355,8 +363,12 @@ class Satellite_Manager:
                     model_state_dict=new_master_state,
                     trained_by=master_wrapper.trained_by + [sat_id]
                 )
-                self.satellite_models[master_id] = master_wrapper
                 
+                m_acc, m_loss = self._evaluate_direct(temp_model, self.val_loader, f"Master-SAT{master_id}", new_master_ver, "MASTER_TEST")
+
+                self.satellite_models[master_id] = master_wrapper
+                self.satellite_performances[master_id] = m_acc
+
                 # 2. Worker가 Master 모델을 Sync (Downlink)
                 # Worker는 접속한 Master의 모델을 복제해감 (지식 전파)
                 current_local_wrapper = PyTorchModel(
@@ -366,7 +378,7 @@ class Satellite_Manager:
                 )
                 self.satellite_models[sat_id] = current_local_wrapper
                 
-                self.sim_logger.info(f"🔗 [Layer1] SAT_{sat_id} <-> Master_{master_id} Sync (v{new_master_ver:.2f})")
+                self.sim_logger.info(f"🔗 [Layer1] SAT_{sat_id} <-> Master_{master_id} Sync (v{new_master_ver:.2f}), Acc: {m_acc:.2f}%")
 
             # -----------------------------------------------------------
             # [Event 3] Layer 2 Aggregation (Master -> GS)
@@ -378,18 +390,17 @@ class Satellite_Manager:
                      self.sim_logger.info(f"📥 [Global] Master_{sat_id} Forced Sync -> v{self.global_model_wrapper.version}")
                      continue
 
-                local_acc = self.satellite_performances[sat_id]
-                loader_idx = sat_id % len(self.client_subsets)
-                local_data_count = len(self.client_subsets[loader_idx])
+                master_acc = self.satellite_performances[sat_id]
+                master_data_count = self.masters_data_count[sat_id]
                 
                 # alpha = 0.2
                 alpha, _, _, _ = calculate_mixing_weight(
                     local_ver=current_local_wrapper.version,
                     global_ver=self.global_model_wrapper.version,
-                    local_acc=local_acc,
+                    local_acc=master_acc,
                     global_acc=self.best_acc,
-                    local_data_count=local_data_count,
-                    avg_data_count=self.avg_data_count
+                    local_data_count=master_data_count,
+                    avg_data_count=avg_cluster_data_count
                 )
                 new_global_state = weighted_update(
                     self.global_model_wrapper.model_state_dict,
